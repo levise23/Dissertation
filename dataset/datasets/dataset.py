@@ -15,7 +15,7 @@ def make_dataset(opt):
         transforms.Resize((opt.h, opt.w), interpolation=3),
         transforms.Pad(opt.pad, padding_mode='edge'),
         transforms.RandomCrop((opt.h, opt.w)),
-        transforms.RandomHorizontalFlip(),
+        #transforms.RandomHorizontalFlip(),
         transforms.ToTensor(),
         transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
     ]
@@ -23,9 +23,9 @@ def make_dataset(opt):
     transform_satellite_list = [
         transforms.Resize((opt.h, opt.w), interpolation=3),
         transforms.Pad(opt.pad, padding_mode='edge'),
-        transforms.RandomAffine(90),
+        
         transforms.RandomCrop((opt.h, opt.w)),
-        transforms.RandomHorizontalFlip(),
+        #transforms.RandomHorizontalFlip(),
         transforms.ToTensor(),
         transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
     ]
@@ -40,10 +40,10 @@ def make_dataset(opt):
         transform_train_list = transform_train_list + [RandomErasing(probability=opt.erasing_p, mean=[0.0, 0.0, 0.0])]
 
     if opt.color_jitter:
-        transform_train_list = [transforms.ColorJitter(brightness=0.1, contrast=0.1, saturation=0.1,
-                                                       hue=0)] + transform_train_list
-        transform_satellite_list = [transforms.ColorJitter(brightness=0.1, contrast=0.1, saturation=0.1,
-                                                           hue=0)] + transform_satellite_list
+        transform_train_list = [transforms.ColorJitter(brightness=0.2, contrast=0.1, saturation=0.1,
+                                                       hue=0.1)] + transform_train_list
+        transform_satellite_list = [transforms.ColorJitter(brightness=0.2, contrast=0.1, saturation=0.1,
+                                                           hue=0.1)] + transform_satellite_list
 
     if opt.DA:
         transform_train_list = [ImageNetPolicy()] + transform_train_list

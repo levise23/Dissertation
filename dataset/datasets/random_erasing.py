@@ -9,18 +9,7 @@ import math
 #import torch
 
 class RandomErasing(object):
-    """ Randomly selects a rectangle region in an image and erases its pixels.
-        'Random Erasing Data Augmentation' by Zhong et al.
-        See https://arxiv.org/pdf/1708.04896.pdf
-    Args:
-         probability: The probability that the Random Erasing operation will be performed.
-         sl: Minimum proportion of erased area against input image.
-         sh: Maximum proportion of erased area against input image.
-         r1: Minimum aspect ratio of erased area.
-         mean: Erasing value. 
-    """
-    
-    def __init__(self, probability = 0.5, sl = 0.02, sh = 0.4, r1 = 0.3, mean=[0.4914, 0.4822, 0.4465]):
+    def __init__(self, probability=0.5, sl=0.02, sh=0.4, r1=0.3, mean=[0.4914, 0.4822, 0.4465]):
         self.probability = probability
         self.mean = mean
         self.sl = sl
@@ -28,10 +17,12 @@ class RandomErasing(object):
         self.r1 = r1
        
     def __call__(self, img):
-
         if random.uniform(0, 1) > self.probability:
             return img
 
+        # ✅ 先 clone，避免修改原张量
+        img = img.clone()
+        
         for attempt in range(100):
             area = img.size()[1] * img.size()[2]
        
@@ -41,7 +32,8 @@ class RandomErasing(object):
             h = int(round(math.sqrt(target_area * aspect_ratio)))
             w = int(round(math.sqrt(target_area / aspect_ratio)))
 
-            if w < img.size()[2] and h < img.size()[1]:
+            # ✅ 改为 <= 更严格
+            if w <= img.size()[2] and h <= img.size()[1]:
                 x1 = random.randint(0, img.size()[1] - h)
                 y1 = random.randint(0, img.size()[2] - w)
                 if img.size()[0] == 3:
@@ -53,4 +45,3 @@ class RandomErasing(object):
                 return img
 
         return img
-

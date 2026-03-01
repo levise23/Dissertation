@@ -89,9 +89,6 @@ class build_transformer(nn.Module):
     def __init__(self, opt, num_classes, block=4, return_f=False):
         super(build_transformer, self).__init__()
         self.return_f = return_f
-        self.text_fuse = bool(getattr(opt, "text_fuse", False))
-        self.text_dim = int(getattr(opt, "text_dim", 512))
-        self.text_layers = int(getattr(opt, "text_layers", 1))
 
         if opt.backbone == "VIT-S":
             model_path = opt.pretrain_path

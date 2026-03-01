@@ -11,7 +11,15 @@ class DINOv2_Backbone(nn.Module):
         # 自动从官方拉取 DINOv2 权重，无需手动下载
         self.backbone = torch.hub.load('facebookresearch/dinov2', 'dinov2_vitb14')
         self.in_planes = 768  # ViT-Base 的特征维度
-
+        # --- 新增：冻结浅层特征，防止预训练知识崩塌 ---
+        # 冻结 patch_embed 层
+        for param in self.backbone.patch_embed.parameters():
+            param.requires_grad = False
+            
+        # 冻结前 6 层 Transformer blocks (ViT-Base 共有 12 层)
+        for i in range(4): 
+            for param in self.backbone.blocks[i].parameters():
+                param.requires_grad = False
     def forward(self, x):
         # DINOv2 requires input shape [B, 3, 224, 224]
         # Use forward_features to get all tokens (CLS + patch tokens)
@@ -47,36 +55,102 @@ class DINOv2_Backbone(nn.Module):
         return x
 
 
+def weights_init_kaiming(m):
+    classname = m.__class__.__name__
+    if classname.find('Linear') != -1:
+        nn.init.kaiming_normal_(m.weight, a=0, mode='fan_out')
+        nn.init.constant_(m.bias, 0.0)
+
+    elif classname.find('Conv') != -1:
+        nn.init.kaiming_normal_(m.weight, a=0, mode='fan_in')
+        if m.bias is not None:
+            nn.init.constant_(m.bias, 0.0)
+    elif classname.find('BatchNorm') != -1:
+        if m.affine:
+            nn.init.constant_(m.weight, 1.0)
+            nn.init.constant_(m.bias, 0.0)
+
+def weights_init_classifier(m):
+    classname = m.__class__.__name__
+    if classname.find('Linear') != -1:
+        nn.init.normal_(m.weight.data, std=0.001)
+        nn.init.constant_(m.bias.data, 0.0)
+
 class ClassBlock(nn.Module):
-    """【参考FSRA】单个分类头，用于计算分类损失和特征"""
-    def __init__(self, input_dim, class_num, return_f=False):
+    """
+    【融合版本】单个分类头，用于计算分类损失和特征
+    
+    融合了旧版本的灵活参数 + 新版本的bug修复（评估时总是返回logit）
+    """
+    def __init__(self, input_dim, class_num, droprate=0.5, relu=False, bnorm=True, 
+                 num_bottleneck=512, linear=True, return_f=False):
         super(ClassBlock, self).__init__()
         self.return_f = return_f
         
-        self.bottleneck = nn.BatchNorm1d(input_dim)
-        self.bottleneck.bias.requires_grad_(False)
-        nn.init.constant_(self.bottleneck.weight, 1.0)
-        nn.init.constant_(self.bottleneck.bias, 0.0)
+        # 构建特征处理流程
+        add_block = []
         
-        self.classifier = nn.Linear(input_dim, class_num, bias=False)
-        nn.init.normal_(self.classifier.weight, std=0.001)
+        # 1. 可选的线性投影（bottleneck）
+        if linear:
+            add_block += [nn.Linear(input_dim, num_bottleneck)]
+        else:
+            num_bottleneck = input_dim
+        
+        # 2. 可选的归一化
+        if bnorm:
+            add_block += [nn.BatchNorm1d(num_bottleneck)]
+        
+        # 3. 可选的激活函数
+        if relu:
+            add_block += [nn.LeakyReLU(0.1)]
+        
+        # 4. 可选的正则化
+        if droprate > 0:
+            add_block += [nn.Dropout(p=droprate)]
+        
+        # 构建特征块
+        add_block = nn.Sequential(*add_block)
+        add_block.apply(weights_init_kaiming)
+        
+        # 构建分类器
+        classifier = nn.Linear(num_bottleneck, class_num)
+        classifier.apply(weights_init_classifier)
+        
+        self.add_block = add_block
+        self.classifier = classifier
 
     def forward(self, x):
-        # x: [B, D]
-        feat = self.bottleneck(x)
+        """
+        前向传播
+        
+        训练模式:
+            - return_f=True: 返回 (logit, feat)
+            - return_f=False: 返回 logit
+        
+        评估模式（修复bug）:
+            - 总是返回 (logit, feat)，便于特征提取和检索指标计算
+        """
+        # 提取特征
+        feat = self.add_block(x)
+        
+        # 计算分类输出
         logit = self.classifier(feat)
         
-        # 【修复】验证时总是返回特征，训练时根据 return_f 决定
-        # 这样可以在 validate_reid 中提取特征用于计算检索指标
-        if self.return_f or not self.training:
+        # 【修复】评估时也返回 (logit, feat)，不再丢失 logit
+        if self.training:
+            if self.return_f:
+                return logit, feat
+            else:
+                return logit
+        else:
+            # 评估模式：总是返回 (logit, feat)
             return logit, feat
-        return logit
 
 # ==========================================
 # 2. 组装网络: 双视图 (卫星 + 无人机) + 热力分组
 # ==========================================
 class two_view_net(nn.Module):
-    def __init__(self, opt, class_num, block=1, return_f=False):
+    def __init__(self, opt, class_num, block=3, return_f=False):
         super(two_view_net, self).__init__()
         self.return_f = return_f
         self.block = block
@@ -104,8 +178,8 @@ class two_view_net(nn.Module):
         Returns:
             part_features: [B, D, block] - 分组后的特征
         """
-        # 计算热力：对每个patch的特征求L2范数，作为重要性分数
-        heatmap = torch.norm(patch_features, p=2, dim=2)  # [B, num_patch]
+        # 计算热力：对每个patch的特征求L2范数，作为重要性分数/改了
+        heatmap = torch.mean(patch_features, dim=-1)  # [B, num_patch]
         
         # 按热力从高到低排序
         num_patches = patch_features.size(1)
@@ -239,15 +313,6 @@ class two_view_net(nn.Module):
 # 3. 工厂函数
 # ==========================================
 def make_model(opt):
-    """
-    创建模型，支持多块热力分组
-    
-    Args:
-        opt: 配置对象，包括：
-            - opt.nclasses: 类别数
-            - opt.block: 热力分组数（默认1，如果>1则启用局部特征）
-            - opt.triplet_loss: triplet loss 权重（>0时返回特征）
-    """
     return_f = bool(opt.triplet_loss > 0)
     block = getattr(opt, 'block', 1)
     

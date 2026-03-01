@@ -179,33 +179,33 @@ def validate_reid(model, val_loader, use_gpu=True, verbose=False):
     
     # 计算距离矩阵留在 CPU 上，避免显存爆炸
     # 先归一化特征
-    # query_features = F.normalize(query_features, p=2, dim=1)
-    # gallery_features = F.normalize(gallery_features, p=2, dim=1)
-    
-    # # 计算余弦距离矩阵（CPU 上进行）
-    # dist_matrix = 1 - torch.mm(query_features, gallery_features.t())
-    
-    # # 计算 CMC 和 mAP
-    # cmc, mAP = compute_cmc_and_map(dist_matrix, query_labels, gallery_labels)
-    # === 之前的代码保持不变 ===
-    # 先归一化特征
     query_features = F.normalize(query_features, p=2, dim=1)
     gallery_features = F.normalize(gallery_features, p=2, dim=1)
     
-    # --- 新增：使用重排算法 ---
-    # 转换为 numpy 数组
-    q_f_np = query_features.numpy()
-    g_f_np = gallery_features.numpy()
+    # # 计算余弦距离矩阵（CPU 上进行）
+    dist_matrix = 1 - torch.mm(query_features, gallery_features.t())
     
-    # 计算重排后的距离矩阵
-    dist_matrix_np = re_ranking(q_f_np, g_f_np, k1=20, k2=6, lambda_value=0.3)
-    
-    # 转回 Tensor
-    dist_matrix = torch.from_numpy(dist_matrix_np).to(query_features.device)
-    # ---------------------------
-    
-    # 计算 CMC 和 mAP (这部分保持不变)
+    # # 计算 CMC 和 mAP
     cmc, mAP = compute_cmc_and_map(dist_matrix, query_labels, gallery_labels)
+    # === 之前的代码保持不变 ===
+    # 先归一化特征
+    # query_features = F.normalize(query_features, p=2, dim=1)
+    # gallery_features = F.normalize(gallery_features, p=2, dim=1)
+    
+    # # --- 新增：使用重排算法 ---
+    # # 转换为 numpy 数组
+    # q_f_np = query_features.numpy()
+    # g_f_np = gallery_features.numpy()
+    
+    # # 计算重排后的距离矩阵
+    # dist_matrix_np = re_ranking(q_f_np, g_f_np, k1=20, k2=6, lambda_value=0.3)
+    
+    # # 转回 Tensor
+    # dist_matrix = torch.from_numpy(dist_matrix_np).to(query_features.device)
+    # # ---------------------------
+    
+    # # 计算 CMC 和 mAP (这部分保持不变)
+    # cmc, mAP = compute_cmc_and_map(dist_matrix, query_labels, gallery_labels)
     # 计算 R@k
     metrics = {
         'R@1': float(cmc[0]),
@@ -224,33 +224,32 @@ def get_parse():
     parser.add_argument('--val_csv_path', default='/usr1/home/s125mdg43_07/remote/rebuild_UAV/val_pairs.csv', type=str, help='path to the val csv file')
 
     parser.add_argument('--train_all', action='store_true', help='use all training data')
-    parser.add_argument('--color_jitter', action='store_true', help='use color jitter in training')
+    parser.add_argument('--color_jitter', default=True, help='use color jitter in training')
     parser.add_argument('--num_worker', default=6, type=int, help='number of dataloader workers')
-    parser.add_argument('--batchsize', default=64, type=int, help='batchsize')
-    parser.add_argument('--pad', default=0, type=int, help='padding')
+    parser.add_argument('--batchsize', default=96, type=int, help='batchsize')
+    parser.add_argument('--pad', default=20, type=int, help='padding')
     
-    # 强制建议设为 224 或 252，千万不要用 532！
     parser.add_argument('--h', default=224, type=int, help='height')
     parser.add_argument('--w', default=224, type=int, help='width')
     
     parser.add_argument('--views', default=2, type=int, help='the number of views (satellite & drone)')
-    parser.add_argument('--erasing_p', default=0, type=float, help='Random Erasing probability, in [0,1]')
+    parser.add_argument('--erasing_p', default=0.2, type=float, help='Random Erasing probability, in [0,1]')
     parser.add_argument('--warm_epoch', default=0, type=int, help='the first K epoch that needs warm up')
     parser.add_argument('--lr', default=0.001, type=float, help='learning rate')
     parser.add_argument('--moving_avg', default=1.0, type=float, help='moving average')
-    parser.add_argument('--DA', action='store_true', help='use Color Data Augmentation')
+    parser.add_argument('--DA', default=False, help='use Color Data Augmentation')
     parser.add_argument('--share', action='store_true', default=True, help='share weight between different view')
     
     parser.add_argument('--fp16', action='store_true', default=False, help='use apex fp16 (deprecated)' )
     parser.add_argument('--autocast', action='store_true', default=True, help='use native mix precision')
     
-    parser.add_argument('--block', default=1, type=int, help='')
-    parser.add_argument('--kl_loss', action='store_true', default=False, help='kl_loss')
-    parser.add_argument('--triplet_loss', default=0.3, type=float, help='')
+    parser.add_argument('--block', default=3, type=int, help='')
+    parser.add_argument('--kl_loss', default=True, help='kl_loss')
+    parser.add_argument('--triplet_loss', default=1, type=float, help='')
     
     parser.add_argument('--sample_num', default=2, type=int, help='num of repeat sampling')
     parser.add_argument('--num_epochs', default=80, type=int, help='')
-    parser.add_argument('--steps', default=[40, 70], type=int, help='')
+    parser.add_argument('--steps', default=[40, 60, 78], type=int, help='')
     parser.add_argument('--backbone', default="VIT-S", type=str, help='')
     parser.add_argument('--pretrain_path', default="", type=str, help='')
     
@@ -316,63 +315,60 @@ def train_model(model, opt, optimizer, scheduler, dataloaders_dict, log_path=Non
             with autocast(enabled=opt.autocast):
                 outputs_s, outputs_d = model(inputs_s, inputs_d)
                 
-                # 【新增】处理多块热力分组的返回格式
-                # 模型可能返回：
-                #   1. 简单格式 (block=1, return_f=False)：(cls_s, cls_d)
-                #   2. 简单格式 (block=1, return_f=True)：((cls_s, feat_s), (cls_d, feat_d))
-                #   3. 复杂格式 (block>1, return_f=True)：(([cls_0, cls_1, ...], [feat_0, feat_1, ...]), ...)
-                
+                # 第1步：先初始化设备和特征（最优先！）
+                current_device = inputs_s.device
                 features_s, features_d = None, None
                 
-                # 如果模型返回 (outputs, features) 的形式
+                # 第2步：解析返回格式
                 if isinstance(outputs_s, (list, tuple)) and len(outputs_s) == 2:
-                    # 检查是否是 ([cls列表], [feat列表]) 的形式（多块）
                     if isinstance(outputs_s[0], list) and isinstance(outputs_s[1], list):
-                        # 多块格式：([cls_0, cls_1, ..., cls_global], [feat_0, feat_1, ..., feat_global])
                         outputs_s_list, features_s = outputs_s
                         outputs_d_list, features_d = outputs_d
                         outputs_s = outputs_s_list
                         outputs_d = outputs_d_list
                     else:
-                        # 单块格式：(cls, feat)
                         outputs_s, features_s = outputs_s
                         outputs_d, features_d = outputs_d
-
-                current_device = inputs_s.device
-                f_triplet_loss = torch.tensor(0.0, device=current_device)
-                kl_loss = torch.tensor(0.0, device=current_device)
-
-                # 【新增】从特征列表中提取全局特征用于triplet loss
-                feat_s_for_triplet = _select_global_feature(features_s)
-                feat_d_for_triplet = _select_global_feature(features_d)
                 
-                if opt.triplet_loss > 0 and feat_s_for_triplet is not None:
-                    split_num = opt.batchsize // opt.sample_num
-                    f_triplet_loss = cal_triplet_loss(feat_s_for_triplet, feat_d_for_triplet, labels_s, triplet_loss, split_num)
-
-                # 【新增】处理多个分类输出（来自多块热力分组）
-                # 如果 outputs_s 是列表，对每个输出计算损失然后求和
+                # 第3步：计算分类Loss
                 if isinstance(outputs_s, list):
                     cls_loss = torch.tensor(0.0, device=current_device)
+                    num_outputs = len(outputs_s)
                     for cls_s, cls_d in zip(outputs_s, outputs_d):
                         cls_loss += cal_loss(cls_s, labels_s, criterion)
                         cls_loss += cal_loss(cls_d, labels_d, criterion)
+                    cls_loss = cls_loss / num_outputs
                 else:
                     cls_loss = cal_loss(outputs_s, labels_s, criterion) + cal_loss(outputs_d, labels_d, criterion)
-
-                # 【新增】KL loss也需要处理多个输出
+                
+                # 第4步：计算KL Loss
                 if opt.kl_loss:
                     if isinstance(outputs_s, list):
                         kl_loss = torch.tensor(0.0, device=current_device)
+                        num_outputs = len(outputs_s)
                         for cls_s, cls_d in zip(outputs_s, outputs_d):
                             kl_loss += cal_kl_loss(cls_s, cls_d, loss_kl)
+                        kl_loss = kl_loss / num_outputs
                     else:
                         kl_loss = cal_kl_loss(outputs_s, outputs_d, loss_kl)
-
-                # 【修复】平衡三项损失：如果特征对齐不足，可调高 triplet_weight（默认 1.0）
-                triplet_weight = 1.0  # ⚠️ 若 Epoch 40 时 R@1 < 10%，改为 2.0 或 3.0
-                loss = kl_loss + cls_loss + triplet_weight * f_triplet_loss
-
+                else:
+                    kl_loss = torch.tensor(0.0, device=current_device)
+                
+                # 第5步：计算Triplet Loss
+                f_triplet_loss = torch.tensor(0.0, device=current_device)
+                if opt.triplet_loss > 0 and features_s is not None:
+                    split_num = opt.batchsize // opt.sample_num
+                    if isinstance(features_s, list):
+                        num_features = len(features_s)
+                        for feat_s, feat_d in zip(features_s, features_d):
+                            f_triplet_loss += cal_triplet_loss(feat_s, feat_d, labels_s, triplet_loss, split_num)
+                        f_triplet_loss = f_triplet_loss / num_features
+                    else:
+                        f_triplet_loss = cal_triplet_loss(features_s, features_d, labels_s, triplet_loss, split_num)
+                
+                # 第6步：合并Loss
+                loss = cls_loss + kl_loss + f_triplet_loss*opt.triplet_loss
+                
                 if epoch < opt.warm_epoch:
                     warm_up = min(1.0, warm_up + 0.9 / warm_iteration)
                     loss *= warm_up
@@ -384,7 +380,7 @@ def train_model(model, opt, optimizer, scheduler, dataloaders_dict, log_path=Non
                 scaler.unscale_(optimizer)
                 torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=5.0)
 
-                scaler.step(optimizer)
+                scaler.step(optimizer) 
                 scaler.update()
             else:
                 loss.backward()
