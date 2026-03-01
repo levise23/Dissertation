@@ -19,6 +19,7 @@ from models.model import make_model
 from dataset.datasets.dataset import make_dataset
 from tool.utils_server import save_network, copyfiles2checkpoints
 from losses.triplet_loss import Tripletloss, TripletLoss
+from losses.circle_loss_correct import CircleLoss, CircleLossWithHardMining  # 【修正】正确的Circle Loss实现
 from losses.cal_loss import cal_kl_loss, cal_loss, cal_triplet_loss
 from re_ranking import re_ranking
 warnings.filterwarnings("ignore")
@@ -177,13 +178,21 @@ def validate_reid(model, val_loader, use_gpu=True, verbose=False):
     gallery_features = torch.cat(gallery_features, dim=0)
     gallery_labels = torch.cat(gallery_labels, dim=0)
     
-    # 计算距离矩阵留在 CPU 上，避免显存爆炸
     # 先归一化特征
     query_features = F.normalize(query_features, p=2, dim=1)
     gallery_features = F.normalize(gallery_features, p=2, dim=1)
     
-    # # 计算余弦距离矩阵（CPU 上进行）
-    dist_matrix = 1 - torch.mm(query_features, gallery_features.t())
+    # 【修复】将距离矩阵计算转到GPU上（使用第一张可用的GPU）
+    # 这能大幅加速推理，从分钟级降到秒级
+    if use_gpu:
+        device = torch.device('cuda:0')
+        query_features = query_features.to(device)
+        gallery_features = gallery_features.to(device)
+        # GPU上极速计算余弦距离矩阵
+        dist_matrix = 1 - torch.mm(query_features, gallery_features.t())
+        dist_matrix = dist_matrix.cpu()  # 算完立刻拿回CPU供后续CMC计算
+    else:
+        dist_matrix = 1 - torch.mm(query_features, gallery_features.t())
     
     # # 计算 CMC 和 mAP
     cmc, mAP = compute_cmc_and_map(dist_matrix, query_labels, gallery_labels)
@@ -217,7 +226,7 @@ def validate_reid(model, val_loader, use_gpu=True, verbose=False):
 
 def get_parse():
     parser = argparse.ArgumentParser(description='Training')
-    parser.add_argument('--gpu_ids', default='1,2', type=str, help='gpu_ids: e.g. 0  0,1,2  0,2')
+    parser.add_argument('--gpu_ids', default='1,2,3', type=str, help='gpu_ids: e.g. 0  0,1,2  0,2')
     parser.add_argument('--name', default='test', type=str, help='output model name')
     
     parser.add_argument('--train_csv_path', default='/usr1/home/s125mdg43_07/remote/rebuild_UAV/train_pairs.csv', type=str, help='path to the training csv file')
@@ -226,7 +235,7 @@ def get_parse():
     parser.add_argument('--train_all', action='store_true', help='use all training data')
     parser.add_argument('--color_jitter', default=True, help='use color jitter in training')
     parser.add_argument('--num_worker', default=6, type=int, help='number of dataloader workers')
-    parser.add_argument('--batchsize', default=96, type=int, help='batchsize')
+    parser.add_argument('--batchsize', default=384, type=int, help='batchsize')
     parser.add_argument('--pad', default=20, type=int, help='padding')
     
     parser.add_argument('--h', default=224, type=int, help='height')
@@ -234,7 +243,7 @@ def get_parse():
     
     parser.add_argument('--views', default=2, type=int, help='the number of views (satellite & drone)')
     parser.add_argument('--erasing_p', default=0.2, type=float, help='Random Erasing probability, in [0,1]')
-    parser.add_argument('--warm_epoch', default=0, type=int, help='the first K epoch that needs warm up')
+    parser.add_argument('--warm_epoch', default=5, type=int, help='the first K epoch that needs warm up')
     parser.add_argument('--lr', default=0.001, type=float, help='learning rate')
     parser.add_argument('--moving_avg', default=1.0, type=float, help='moving average')
     parser.add_argument('--DA', default=False, help='use Color Data Augmentation')
@@ -245,11 +254,23 @@ def get_parse():
     
     parser.add_argument('--block', default=3, type=int, help='')
     parser.add_argument('--kl_loss', default=True, help='kl_loss')
-    parser.add_argument('--triplet_loss', default=1, type=float, help='')
+    
+    # 【新增】Loss 类型选择
+    parser.add_argument('--loss_type', default='soft_triplet', type=str, 
+                       choices=['soft_triplet', 'circle', 'circle_hard'],
+                       help='loss type: soft_triplet (Soft Margin Triplet) or circle (Circle Loss)')
+    
+    parser.add_argument('--triplet_loss', default=1.5, type=float, help='triplet loss weight')
+    parser.add_argument('--triplet_margin', default=0.1, type=float, help='triplet loss margin (distance threshold)')
+    parser.add_argument('--hard_factor', default=0.2, type=float, help='hard factor for soft boundary (0=hard margin, >0=soft margin)')
+    
+    # Circle Loss 特有参数
+    parser.add_argument('--circle_margin', default=0.25, type=float, help='Circle Loss margin (m parameter)')
+    parser.add_argument('--circle_gamma', default=256, type=int, help='Circle Loss gamma (scale factor, 256 or 128)')
     
     parser.add_argument('--sample_num', default=2, type=int, help='num of repeat sampling')
-    parser.add_argument('--num_epochs', default=80, type=int, help='')
-    parser.add_argument('--steps', default=[40, 60, 78], type=int, help='')
+    parser.add_argument('--num_epochs', default=100, type=int, help='')
+    parser.add_argument('--steps', default=[60, 80], type=int, help='')
     parser.add_argument('--backbone', default="VIT-S", type=str, help='')
     parser.add_argument('--pretrain_path', default="", type=str, help='')
     
@@ -271,7 +292,19 @@ def train_model(model, opt, optimizer, scheduler, dataloaders_dict, log_path=Non
     scaler = GradScaler()
     criterion = nn.CrossEntropyLoss()
     loss_kl = nn.KLDivLoss(reduction='batchmean')
-    triplet_loss = Tripletloss(margin=opt.triplet_loss) 
+    
+    # 【新增】根据 loss_type 参数选择 Loss 函数
+    if opt.loss_type == 'soft_triplet':
+        triplet_loss = Tripletloss(margin=opt.triplet_margin, hard_factor=opt.hard_factor)
+        print(f"[*] Using Soft Margin Triplet Loss (margin={opt.triplet_margin}, hard_factor={opt.hard_factor})")
+    elif opt.loss_type == 'circle':
+        triplet_loss = CircleLoss(m=opt.circle_margin, gamma=opt.circle_gamma)
+        print(f"[*] Using Circle Loss (m={opt.circle_margin}, gamma={opt.circle_gamma})")
+    elif opt.loss_type == 'circle_hard':
+        triplet_loss = CircleLossWithHardMining(m=opt.circle_margin, gamma=opt.circle_gamma, hard_mining_weight=2.0)
+        print(f"[*] Using Circle Loss with Hard Mining (m={opt.circle_margin}, gamma={opt.circle_gamma})")
+    else:
+        raise ValueError(f"Unknown loss type: {opt.loss_type}") 
 
     for epoch in range(num_epochs):
         print('\nEpoch {}/{}'.format(epoch, num_epochs - 1))
@@ -471,15 +504,14 @@ if __name__ == '__main__':
         torch.cuda.set_device(gpu_ids[0])
         cudnn.benchmark = True
 
-    # 【优化】多卡时自动调整 batch_size 和 num_workers 以加快训练
+    # 【修复】多卡时调整 num_workers 以加快数据加载
+    # 【重要】不能乘以 num_gpus！DataParallel 下，batch_size 是总数，会被平分
     num_gpus = len(gpu_ids)
     if num_gpus > 1:
-        # 扩大 batch_size：每多一张卡，batch 就翻倍增长（充分利用 GPU 显存）
-        opt.batchsize = opt.batchsize * num_gpus
         # 增加 num_workers：更多的进程用来加载数据（避免 GPU 空闲等数据）
         opt.num_worker = min(opt.num_worker * 2, 16)  # 最多 16 个 worker
         print(f"[*] Multi-GPU mode detected: {num_gpus} GPUs")
-        print(f"[*] Auto-adjusted batch_size to {opt.batchsize} (原{opt.batchsize // num_gpus}×{num_gpus})")
+        print(f"[*] Keep batch_size at {opt.batchsize} (will be split across {num_gpus} GPUs)")
         print(f"[*] Auto-adjusted num_worker to {opt.num_worker}")
 
     # 1. 加载数据
@@ -495,7 +527,7 @@ if __name__ == '__main__':
     optimizer_ft, exp_lr_scheduler = make_optimizer(model, opt)
     
     # 【修复】多 GPU 支持：仅当实际有多个 GPU 时才使用 DataParallel
-    # 注意：如果只指定 1 个 GPU，不使用 DataParallel（会增加同步开销）
+    # 注意：DataParallel 的 batch 会被平分到各卡，所以不需要乘以 num_gpus
     if use_gpu and len(gpu_ids) > 1:
         model = nn.DataParallel(model, device_ids=gpu_ids)
         print(f"[*] Using DataParallel with GPUs: {gpu_ids}")

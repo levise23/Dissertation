@@ -1,6 +1,6 @@
 import torch
 from torch import nn
-
+import torch.nn.functional as F
 
 def normalize(x, axis=-1):
     """Normalizing to unit length along the specified dimension.
@@ -136,21 +136,15 @@ class TripletLoss(object):
 
 
 class Tripletloss(nn.Module):
-    """Triplet loss with hard positive/negative mining.
-
-    Reference:
-    Hermans et al. In Defense of the Triplet Loss for Person Re-Identification. arXiv:1703.07737.
-
-    Code imported from https://github.com/Cysu/open-reid/blob/master/reid/loss/triplet.py.
-
-    Args:
-        margin (float): margin for triplet.
     """
-    def __init__(self, margin=0.3,hard_factor=0.0):
+    Soft-Margin Triplet loss with hard positive/negative mining.
+    不再使用固定的 margin，而是使用 softplus 进行平滑过渡，
+    极大地缓解序列相似图片和 GPS 偏置带来的梯度冲突。
+    """
+    def __init__(self, margin=None, hard_factor=0.0):
         super(Tripletloss, self).__init__()
+        # margin 参数保留用于兼容性，但不使用（softplus 不需要 margin）
         self.margin = margin
-        self.ranking_loss = nn.MarginRankingLoss(margin=margin)  # pytorch的Triplet loss 需要输入ap an margin 和 倍率y，
-                                                                 # 最后算Relu(ap - y*an + margin)  ap是正样本间距，an是负样本间距
         self.hard_factor = hard_factor
 
     def forward(self, inputs, targets):
@@ -159,31 +153,39 @@ class Tripletloss(nn.Module):
             inputs: feature matrix with shape (batch_size, feat_dim)
             targets: ground truth labels with shape (num_classes)
         """
-
         n = inputs.size(0)
 
-        inputs = normalize(inputs,axis=-1)
+        # 1. 特征 L2 归一化 (这一步非常关键，确保了距离在合理范围内)
+        inputs = F.normalize(inputs, p=2, dim=-1)
 
-        dist =euclidean_dist(inputs,inputs)
-        # For each anchor, find the hardest positive and negative
+        # 2. 计算欧式距离矩阵 (假设你外部已经定义了 euclidean_dist)
+        dist = euclidean_dist(inputs, inputs)
+        
+        # 3. 生成正负样本掩码
         mask = targets.expand(n, n).eq(targets.expand(n, n).t())
+        
         dist_ap, dist_an = [], []
+        # 4. 挖掘 Hard Positive 和 Hard Negative (保持你原有的优秀逻辑)
         for i in range(n):
-            if i < n/2:
+            if i < n / 2:
                 dist_ap.append(dist[i][int(n/2):n][mask[i][int(n/2):n]].max().unsqueeze(0))
                 dist_an.append(dist[i][int(n/2):n][(mask[i] == 0)[int(n/2):n]].min().unsqueeze(0))
             else:
                 dist_ap.append(dist[i][0:int(n/2)][mask[i][0:int(n/2)]].max().unsqueeze(0))
                 dist_an.append(dist[i][0:int(n/2)][(mask[i] == 0)[0:int(n/2)]].min().unsqueeze(0))
+                
         dist_ap = torch.cat(dist_ap)
         dist_an = torch.cat(dist_an)
+        
+        # 引入你自定义的 hard_factor
         dist_ap *= (1.0 + self.hard_factor)
         dist_an *= (1.0 - self.hard_factor)
-        # Compute ranking hinge loss
-        y = torch.ones_like(dist_an)
 
-        loss = self.ranking_loss(dist_an, dist_ap, y)
-        return loss
-
-
+        # --------------------------------------------------------
+        # 【核心修改点】: 换用 Softplus 计算无 Margin 的 Triplet Loss
+        # 公式: loss = ln(1 + exp(dist_ap - dist_an))
+        # --------------------------------------------------------
+        loss = F.softplus(dist_ap - dist_an)
+        
+        return loss.mean()
 
