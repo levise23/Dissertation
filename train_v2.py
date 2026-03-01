@@ -20,7 +20,7 @@ from dataset.datasets.dataset import make_dataset
 from tool.utils_server import save_network, copyfiles2checkpoints
 from losses.triplet_loss import Tripletloss, TripletLoss
 from losses.cal_loss import cal_kl_loss, cal_loss, cal_triplet_loss
-
+from re_ranking import re_ranking
 warnings.filterwarnings("ignore")
 version = torch.__version__
 
@@ -179,15 +179,33 @@ def validate_reid(model, val_loader, use_gpu=True, verbose=False):
     
     # 计算距离矩阵留在 CPU 上，避免显存爆炸
     # 先归一化特征
+    # query_features = F.normalize(query_features, p=2, dim=1)
+    # gallery_features = F.normalize(gallery_features, p=2, dim=1)
+    
+    # # 计算余弦距离矩阵（CPU 上进行）
+    # dist_matrix = 1 - torch.mm(query_features, gallery_features.t())
+    
+    # # 计算 CMC 和 mAP
+    # cmc, mAP = compute_cmc_and_map(dist_matrix, query_labels, gallery_labels)
+    # === 之前的代码保持不变 ===
+    # 先归一化特征
     query_features = F.normalize(query_features, p=2, dim=1)
     gallery_features = F.normalize(gallery_features, p=2, dim=1)
     
-    # 计算余弦距离矩阵（CPU 上进行）
-    dist_matrix = 1 - torch.mm(query_features, gallery_features.t())
+    # --- 新增：使用重排算法 ---
+    # 转换为 numpy 数组
+    q_f_np = query_features.numpy()
+    g_f_np = gallery_features.numpy()
     
-    # 计算 CMC 和 mAP
+    # 计算重排后的距离矩阵
+    dist_matrix_np = re_ranking(q_f_np, g_f_np, k1=20, k2=6, lambda_value=0.3)
+    
+    # 转回 Tensor
+    dist_matrix = torch.from_numpy(dist_matrix_np).to(query_features.device)
+    # ---------------------------
+    
+    # 计算 CMC 和 mAP (这部分保持不变)
     cmc, mAP = compute_cmc_and_map(dist_matrix, query_labels, gallery_labels)
-    
     # 计算 R@k
     metrics = {
         'R@1': float(cmc[0]),
@@ -199,11 +217,11 @@ def validate_reid(model, val_loader, use_gpu=True, verbose=False):
 
 def get_parse():
     parser = argparse.ArgumentParser(description='Training')
-    parser.add_argument('--gpu_ids', default='0,1', type=str, help='gpu_ids: e.g. 0  0,1,2  0,2')
+    parser.add_argument('--gpu_ids', default='1,2', type=str, help='gpu_ids: e.g. 0  0,1,2  0,2')
     parser.add_argument('--name', default='test', type=str, help='output model name')
     
-    parser.add_argument('--train_csv_path', default='./train_pairs.csv', type=str, help='path to the training csv file')
-    parser.add_argument('--val_csv_path', default='./val_pairs.csv', type=str, help='path to the val csv file')
+    parser.add_argument('--train_csv_path', default='/usr1/home/s125mdg43_07/remote/rebuild_UAV/train_pairs.csv', type=str, help='path to the training csv file')
+    parser.add_argument('--val_csv_path', default='/usr1/home/s125mdg43_07/remote/rebuild_UAV/val_pairs.csv', type=str, help='path to the val csv file')
 
     parser.add_argument('--train_all', action='store_true', help='use all training data')
     parser.add_argument('--color_jitter', action='store_true', help='use color jitter in training')
@@ -231,13 +249,13 @@ def get_parse():
     parser.add_argument('--triplet_loss', default=0.3, type=float, help='')
     
     parser.add_argument('--sample_num', default=2, type=int, help='num of repeat sampling')
-    parser.add_argument('--num_epochs', default=120, type=int, help='')
-    parser.add_argument('--steps', default=[70, 110], type=int, help='')
+    parser.add_argument('--num_epochs', default=80, type=int, help='')
+    parser.add_argument('--steps', default=[40, 70], type=int, help='')
     parser.add_argument('--backbone', default="VIT-S", type=str, help='')
     parser.add_argument('--pretrain_path', default="", type=str, help='')
     
     # 【新增】验证频率控制：每 N 个 epoch 验证一次，避免频繁计算全量矩阵导致 OOM
-    parser.add_argument('--val_freq', default=10, type=int, help='validation frequency (every N epochs)')
+    parser.add_argument('--val_freq', default=2, type=int, help='validation frequency (every N epochs)')
 
     opt = parser.parse_args()
     return opt
@@ -362,6 +380,10 @@ def train_model(model, opt, optimizer, scheduler, dataloaders_dict, log_path=Non
             # 反向传播和更新权重
             if opt.autocast:
                 scaler.scale(loss).backward()
+                # 新增：解缩放并截断梯度，防止梯度爆炸
+                scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=5.0)
+
                 scaler.step(optimizer)
                 scaler.update()
             else:

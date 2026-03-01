@@ -1,0 +1,14 @@
+# 1. 忽略 Python 自动生成的编译缓存
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# 2. 忽略深度学习模型权重 (防止把几百MB的 pth 文件推送到云端导致仓库卡死)
+checkpoints/
+*.pth
+*.pt
+
+# 3. 忽略本地的训练数据集和日志
+*.csv
+*.log
