@@ -21,7 +21,7 @@ from tool.utils_server import save_network, copyfiles2checkpoints
 from losses.triplet_loss import Tripletloss, TripletLoss
 from losses.circle_loss_correct import CircleLoss, CircleLossWithHardMining  # 【修正】正确的Circle Loss实现
 from losses.cal_loss import cal_kl_loss, cal_loss, cal_triplet_loss
-from re_ranking import re_ranking
+
 warnings.filterwarnings("ignore")
 version = torch.__version__
 
@@ -110,27 +110,22 @@ def compute_cmc_and_map(dist_matrix, query_labels, gallery_labels):
 
 def validate_reid(model, val_loader, use_gpu=True, verbose=False):
     """
-    验证函数：使用原始的配对 val_loader，分离 Query 和 Gallery 进行标准 1-to-N 检索评估
+    验证函数（严格对齐 FSRA 原版 extract_feature + evaluate_gpu 流程）
     
-    Args:
-        model: 训练好的模型
-        val_loader: 验证集 DataLoader（返回 (data_s, data_d) 配对）
-        use_gpu: 是否使用 GPU
-        verbose: 是否打印进度条（默认 False 以加快速度）
-    
-    Returns:
-        metrics_dict: 包含 R@1, R@10, mAP 的字典
+    FSRA 评估流程：
+    1. model.eval() 时 ClassBlock 只返回 BN 后的 512 维特征
+    2. two_view_net 返回 [B, 512, block+1] 的 3D 张量
+    3. 对 3D 特征做 dim=1 L2-norm × sqrt(block+1)，再 flatten
+    4. 用余弦相似度（torch.mm）做 N×N 全局检索
     """
     model.eval()
     
-    # 分开提取 Query (drone) 和 Gallery (satellite) 的特征
     query_features = []
     query_labels = []
     gallery_features = []
     gallery_labels = []
     
     with torch.no_grad():
-        # 移除 tqdm 以加快验证速度（除非 verbose=True）
         loader = tqdm(val_loader, desc="Validating") if verbose else val_loader
         
         for data_s, data_d in loader:
@@ -143,79 +138,57 @@ def validate_reid(model, val_loader, use_gpu=True, verbose=False):
             
             with autocast(enabled=True):
                 outputs_s, outputs_d = model(inputs_s, inputs_d)
+                # eval 模式下 outputs 是 [B, 512, block+1] 的 3D 张量
                 
-                # 【关键】在评估模式下，model 总是返回特征（由 ClassBlock 保证）
-                # 处理返回格式
-                if isinstance(outputs_s, (tuple, list)) and len(outputs_s) == 2:
-                    if isinstance(outputs_s[0], list) and isinstance(outputs_s[1], list):
-                        # 多块格式：([cls_0, cls_1, ...], [feat_0, feat_1, ...])
-                        features_s = outputs_s[1]  # [feat_0, feat_1, ..., feat_global]
-                        features_d = outputs_d[1]
-                    else:
-                        # 单块格式：(logit, feat)
-                        _, features_s = outputs_s
-                        _, features_d = outputs_d
-                else:
-                    raise ValueError(f"Expected outputs with features in evaluate mode, got: {type(outputs_s)}")
-                
-                # 从特征列表中提取全局特征（最后一个），或直接使用张量
-                features_s = _select_global_feature(features_s)
-                features_d = _select_global_feature(features_d)
-                
-                # 【安全检查】确保特征是张量
-                assert isinstance(features_s, torch.Tensor), f"Expected Tensor, got {type(features_s)}"
-                
-                # 保持特征在 CPU 上，避免显存溢出
-                gallery_features.append(features_s.detach().cpu())
+                gallery_features.append(outputs_s.detach().float().cpu())
                 gallery_labels.append(labels_s.cpu())
                 
-                query_features.append(features_d.detach().cpu())
+                query_features.append(outputs_d.detach().float().cpu())
                 query_labels.append(labels_d.cpu())
     
-    # 合并所有批次数据
+    # 合并所有批次
     query_features = torch.cat(query_features, dim=0)
     query_labels = torch.cat(query_labels, dim=0)
     gallery_features = torch.cat(gallery_features, dim=0)
     gallery_labels = torch.cat(gallery_labels, dim=0)
     
-    # 先归一化特征
-    query_features = F.normalize(query_features, p=2, dim=1)
-    gallery_features = F.normalize(gallery_features, p=2, dim=1)
+    print(f"[VAL] Queries: {len(query_labels)}, Gallery: {len(gallery_labels)}, "
+          f"Feature shape: {query_features.shape}")
     
-    # 【修复】将距离矩阵计算转到GPU上（使用第一张可用的GPU）
-    # 这能大幅加速推理，从分钟级降到秒级
+    # ========== FSRA 原版特征后处理 ==========
+    # 参考 test_server.py extract_feature 中的 3D 特征归一化逻辑：
+    #   fnorm = torch.norm(ff, p=2, dim=1, keepdim=True) * np.sqrt(ff.size(-1))
+    #   ff = ff.div(fnorm.expand_as(ff))
+    #   ff = ff.view(ff.size(0), -1)
+    
+    def fsra_normalize(ff):
+        """FSRA 原版3D特征归一化: L2-norm on dim=1, scale by sqrt(num_parts), flatten"""
+        if len(ff.shape) == 3:
+            # [B, 512, block+1]
+            fnorm = torch.norm(ff, p=2, dim=1, keepdim=True) * np.sqrt(ff.size(-1))
+            ff = ff.div(fnorm.expand_as(ff))
+            ff = ff.view(ff.size(0), -1)  # [B, 512*(block+1)]
+        else:
+            # [B, 512] 单 block 退化情况
+            fnorm = torch.norm(ff, p=2, dim=1, keepdim=True)
+            ff = ff.div(fnorm.expand_as(ff))
+        return ff
+    
+    query_features = fsra_normalize(query_features)
+    gallery_features = fsra_normalize(gallery_features)
+    
+    # ========== 余弦相似度检索（FSRA 用 torch.mm(gf, qf) 即相似度越大越好）==========
     if use_gpu:
         device = torch.device('cuda:0')
         query_features = query_features.to(device)
         gallery_features = gallery_features.to(device)
-        # GPU上极速计算余弦距离矩阵
-        dist_matrix = 1 - torch.mm(query_features, gallery_features.t())
-        dist_matrix = dist_matrix.cpu()  # 算完立刻拿回CPU供后续CMC计算
-    else:
-        dist_matrix = 1 - torch.mm(query_features, gallery_features.t())
     
-    # # 计算 CMC 和 mAP
+    # 用距离（1 - similarity）以便 argsort 升序 = 最相似在前
+    dist_matrix = 1 - torch.mm(query_features, gallery_features.t())
+    dist_matrix = dist_matrix.cpu()
+    
     cmc, mAP = compute_cmc_and_map(dist_matrix, query_labels, gallery_labels)
-    # === 之前的代码保持不变 ===
-    # 先归一化特征
-    # query_features = F.normalize(query_features, p=2, dim=1)
-    # gallery_features = F.normalize(gallery_features, p=2, dim=1)
     
-    # # --- 新增：使用重排算法 ---
-    # # 转换为 numpy 数组
-    # q_f_np = query_features.numpy()
-    # g_f_np = gallery_features.numpy()
-    
-    # # 计算重排后的距离矩阵
-    # dist_matrix_np = re_ranking(q_f_np, g_f_np, k1=20, k2=6, lambda_value=0.3)
-    
-    # # 转回 Tensor
-    # dist_matrix = torch.from_numpy(dist_matrix_np).to(query_features.device)
-    # # ---------------------------
-    
-    # # 计算 CMC 和 mAP (这部分保持不变)
-    # cmc, mAP = compute_cmc_and_map(dist_matrix, query_labels, gallery_labels)
-    # 计算 R@k
     metrics = {
         'R@1': float(cmc[0]),
         'R@10': float(cmc[9]) if len(cmc) > 9 else 1.0,
@@ -229,13 +202,13 @@ def get_parse():
     parser.add_argument('--gpu_ids', default='1,2,3', type=str, help='gpu_ids: e.g. 0  0,1,2  0,2')
     parser.add_argument('--name', default='test', type=str, help='output model name')
     
-    parser.add_argument('--train_csv_path', default='/usr1/home/s125mdg43_07/remote/rebuild_UAV/train_pairs.csv', type=str, help='path to the training csv file')
-    parser.add_argument('--val_csv_path', default='/usr1/home/s125mdg43_07/remote/rebuild_UAV/val_pairs.csv', type=str, help='path to the val csv file')
+    parser.add_argument('--train_csv_path', default='/usr1/home/s125mdg43_07/remote/rebuild_UAV_dataset/stride=4/train_pairs.csv', type=str, help='path to the training csv file')
+    parser.add_argument('--val_csv_path', default='/usr1/home/s125mdg43_07/remote/rebuild_UAV_dataset/stride=4/val_pairs.csv', type=str, help='path to the val csv file')
 
     parser.add_argument('--train_all', action='store_true', help='use all training data')
     parser.add_argument('--color_jitter', default=True, help='use color jitter in training')
     parser.add_argument('--num_worker', default=6, type=int, help='number of dataloader workers')
-    parser.add_argument('--batchsize', default=384, type=int, help='batchsize')
+    parser.add_argument('--batchsize', default=224, type=int, help='batchsize')
     parser.add_argument('--pad', default=20, type=int, help='padding')
     
     parser.add_argument('--h', default=224, type=int, help='height')
@@ -260,7 +233,7 @@ def get_parse():
                        choices=['soft_triplet', 'circle', 'circle_hard'],
                        help='loss type: soft_triplet (Soft Margin Triplet) or circle (Circle Loss)')
     
-    parser.add_argument('--triplet_loss', default=1.5, type=float, help='triplet loss weight')
+    parser.add_argument('--triplet_loss', default=0.2, type=float, help='triplet loss weight')
     parser.add_argument('--triplet_margin', default=0.1, type=float, help='triplet loss margin (distance threshold)')
     parser.add_argument('--hard_factor', default=0.2, type=float, help='hard factor for soft boundary (0=hard margin, >0=soft margin)')
     
@@ -272,7 +245,7 @@ def get_parse():
     parser.add_argument('--num_epochs', default=100, type=int, help='')
     parser.add_argument('--steps', default=[60, 80], type=int, help='')
     parser.add_argument('--backbone', default="VIT-S", type=str, help='')
-    parser.add_argument('--pretrain_path', default="", type=str, help='')
+    parser.add_argument('--pretrain_path', default="", type=str, help='Path to pretrained checkpoint (e.g., net_040.pth). Leave empty to train from scratch with official DINOv2 weights')
     
     # 【新增】验证频率控制：每 N 个 epoch 验证一次，避免频繁计算全量矩阵导致 OOM
     parser.add_argument('--val_freq', default=2, type=int, help='validation frequency (every N epochs)')
@@ -420,9 +393,11 @@ def train_model(model, opt, optimizer, scheduler, dataloaders_dict, log_path=Non
                 optimizer.step()
 
             # 统计数据
+            # 【修复】应该记录加权后的triplet loss，而不是原始值
+            # 这样日志中的train_triplet_loss才能反映实际进入loss的权重
             running_loss += loss.item() * now_batch_size
             running_cls_loss += cls_loss.item() * now_batch_size
-            running_triplet += f_triplet_loss.item() * now_batch_size
+            running_triplet += (f_triplet_loss * opt.triplet_loss).item() * now_batch_size  # 【修复】乘以权重
             running_kl_loss += kl_loss.item() * now_batch_size
 
             if isinstance(outputs_s, list):
@@ -520,7 +495,55 @@ if __name__ == '__main__':
     print(f"[*] Total number of classes (locations): {opt.nclasses}")
 
     # 2. 初始化模型与优化器
+    print("\n" + "="*70)
+    print("【模型初始化】")
+    print("="*70)
+    print(f"[DEBUG] opt.pretrain_path = '{opt.pretrain_path}'")
+    if opt.pretrain_path and len(opt.pretrain_path) > 0:
+        if os.path.exists(opt.pretrain_path):
+            print(f"[✓] Pretrain checkpoint found: {opt.pretrain_path}")
+        else:
+            print(f"[!] WARNING: Pretrain checkpoint NOT found: {opt.pretrain_path}")
+            print(f"[!] Will train from scratch with official DINOv2 weights")
+    else:
+        print(f"[*] No pretrain checkpoint specified (--pretrain_path is empty)")
+        print(f"[*] Training from scratch with official DINOv2 weights")
+    print("="*70 + "\n")
+    
     model = make_model(opt)
+    
+    # 【修复重点】：真正把权重吃进模型里！
+    if opt.pretrain_path and len(opt.pretrain_path) > 0:
+        if os.path.exists(opt.pretrain_path):
+            print(f"[✓] Loading weights from: {opt.pretrain_path}")
+            try:
+                # 加载权重字典
+                state_dict = torch.load(opt.pretrain_path, map_location='cpu')
+                
+                # 兼容 DataParallel 保存的 'module.' 前缀
+                if isinstance(state_dict, dict) and 'net_dict' in state_dict:
+                    state_dict = state_dict['net_dict']
+                
+                # 清理 module 前缀（DataParallel 会加这个前缀）
+                clean_state_dict = {}
+                for k, v in state_dict.items():
+                    clean_key = k.replace('module.', '') if k.startswith('module.') else k
+                    clean_state_dict[clean_key] = v
+                
+                # 加载权重，strict=False 允许大小不匹配（比如新增层）
+                incompatible = model.load_state_dict(clean_state_dict, strict=False)
+                print(f"[✓] Pretrained weights loaded successfully!")
+                if incompatible.missing_keys:
+                    print(f"    Warning: {len(incompatible.missing_keys)} keys not found in checkpoint")
+                if incompatible.unexpected_keys:
+                    print(f"    Warning: {len(incompatible.unexpected_keys)} unexpected keys in checkpoint")
+            except Exception as e:
+                print(f"[!] ERROR loading checkpoint: {e}")
+                print(f"[!] Training from scratch instead...")
+        else:
+            print(f"[!] WARNING: Pretrain checkpoint NOT found: {opt.pretrain_path}")
+            print(f"[!] Training from scratch with official DINOv2 weights")
+    
     if use_gpu:
         model = model.cuda()
 

@@ -77,10 +77,10 @@ class CircleLoss(nn.Module):
             # alpha_p = max(0, O_p - s_p)  # 如果 s_p 太低，权重大；如果 s_p ≈ 1，权重小
             # alpha_n = max(0, s_n - O_n)  # 如果 s_n 太高，权重大；如果 s_n ≈ -1，权重小
             
-            # 使用 detach() 确保权重对原始特征不计梯度
-            # （只有损失项对梯度有影响，权重本身不获得梯度）
-            alpha_p = F.relu(self.O_p - pos_sim.detach())
-            alpha_n = F.relu(neg_sim.detach() - self.O_n)
+            # 【修复】去掉 .detach()，让权重自身也能参与梯度更新
+            # 原论文 CVPR 2020 中，alpha_p 和 alpha_n 作为动态权重，应从相似度中获得梯度
+            alpha_p = F.relu(self.O_p - pos_sim)
+            alpha_n = F.relu(neg_sim - self.O_n)
             
             # 4. 【损失项】带加权 margin 的余弦距离
             # pos 项: -gamma * alpha_p * (s_p - Delta_p)
@@ -145,8 +145,9 @@ class CircleLossWithHardMining(nn.Module):
             
             valid_samples += 1
             
-            alpha_p = F.relu(self.circle_loss.O_p - pos_sim.detach())
-            alpha_n = F.relu(neg_sim.detach() - self.circle_loss.O_n)
+            # 【修复】去掉 .detach()，让权重参与梯度流
+            alpha_p = F.relu(self.circle_loss.O_p - pos_sim)
+            alpha_n = F.relu(neg_sim - self.circle_loss.O_n)
             
             # 【新增】Hard mining：加大难例的权重
             # 硬正样本（距离最远的正样本）

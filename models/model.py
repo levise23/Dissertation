@@ -1,23 +1,86 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import os
 
 # ==========================================
 # 1. 骨干网络: DINOv2 ViT-Base Patch14
 # ==========================================
 class DINOv2_Backbone(nn.Module):
-    def __init__(self):
+    def __init__(self, pretrain_path=None):
         super(DINOv2_Backbone, self).__init__()
         # 自动从官方拉取 DINOv2 权重，无需手动下载
         self.backbone = torch.hub.load('facebookresearch/dinov2', 'dinov2_vitb14')
         self.in_planes = 768  # ViT-Base 的特征维度
-        # --- 新增：冻结浅层特征，防止预训练知识崩塌 ---
-        # 冻结 patch_embed 层
+        
+        # 【新增】如果指定了pretrain_path，加载预训练的权重
+        if pretrain_path and len(pretrain_path) > 0:
+            # 文件存在性检查
+            if not os.path.exists(pretrain_path):
+                print(f"[!] Warning: pretrain_path file not found: {pretrain_path}")
+                print(f"[!] Continuing with official DINOv2 hub weights...")
+            else:
+                print(f"[*] Loading pretrained DINOv2 backbone from: {pretrain_path}")
+                try:
+                    checkpoint = torch.load(pretrain_path, map_location='cpu')
+                except Exception as e:
+                    print(f"[!] Error loading checkpoint file: {e}")
+                    print(f"[!] Continuing with official DINOv2 hub weights...")
+                else:
+                    # 处理不同的checkpoint格式
+                    backbone_state = None
+                    
+                    if isinstance(checkpoint, dict):
+                        # 情况1: 完整的两视图模型（key: backbone.backbone.*）
+                        if any(k.startswith('backbone.backbone.') for k in checkpoint.keys()):
+                            backbone_state = {k.replace('backbone.backbone.', ''): v 
+                                             for k, v in checkpoint.items() 
+                                             if k.startswith('backbone.backbone.')}
+                            print(f"[*] Detected full two_view_net checkpoint format")
+                        
+                        # 情况2: backbone状态字典（key: blocks.*, patch_embed.*, ...）
+                        elif any(k.startswith('blocks') or k.startswith('patch_embed') for k in checkpoint.keys()):
+                            backbone_state = checkpoint
+                            print(f"[*] Detected DINOv2_Backbone checkpoint format")
+                        
+                        # 情况3: 可能是包含backbone的更大字典（按照模块名查找）
+                        elif 'backbone' in checkpoint:
+                            if isinstance(checkpoint['backbone'], dict):
+                                potential_state = checkpoint['backbone']
+                                if any(k.startswith('blocks') or k.startswith('patch_embed') for k in potential_state.keys()):
+                                    backbone_state = potential_state
+                                    print(f"[*] Detected nested checkpoint format (backbone key)")
+                    
+                    if backbone_state is None:
+                        print(f"[!] Could not find backbone weights in checkpoint")
+                        print(f"[!] Available keys (first 20 of {len(checkpoint) if isinstance(checkpoint, dict) else 'unknown'}):")
+                        if isinstance(checkpoint, dict):
+                            for k in list(checkpoint.keys())[:20]:
+                                print(f"    - {k}")
+                        print(f"[!] Continuing with official DINOv2 hub weights...")
+                    else:
+                        try:
+                            # 使用strict=False允许加载部分权重
+                            incompatible_keys = self.backbone.load_state_dict(backbone_state, strict=False)
+                            print(f"[✓] Successfully loaded {len(backbone_state)} backbone weight keys")
+                            if incompatible_keys.missing_keys:
+                                print(f"[!] Missing {len(incompatible_keys.missing_keys)} keys (will use random init)")
+                            if incompatible_keys.unexpected_keys:
+                                print(f"[!] {len(incompatible_keys.unexpected_keys)} unexpected keys (ignored)")
+                        except Exception as e:
+                            print(f"[!] Error loading backbone state: {e}")
+                            print(f"[!] Continuing with partial weights...")
+        
+        # --- 冻结浅层特征，防止预训练知识崩塌 ---
+        # 对于新数据集 (group_4)，冻结的层数改为更激进的方案
+        # 冻结 patch_embed 层（保护初始特征提取）
         for param in self.backbone.patch_embed.parameters():
             param.requires_grad = False
             
-        # 冻结前 6 层 Transformer blocks (ViT-Base 共有 12 层)
-        for i in range(4): 
+        # 【改动】对于新数据集，仅冻结前 2 层 Transformer blocks (ViT-Base 共有 12 层)
+        # 这样有更多层可以适应新数据集的分布
+        # 原来冻结 4 层太保守了，导致模型不能很好地适应新数据
+        for i in range(2): 
             for param in self.backbone.blocks[i].parameters():
                 param.requires_grad = False
     def forward(self, x):
@@ -121,30 +184,27 @@ class ClassBlock(nn.Module):
 
     def forward(self, x):
         """
-        前向传播
+        前向传播（严格对齐 FSRA 原版 ClassBlock）
         
         训练模式:
             - return_f=True: 返回 (logit, feat)
             - return_f=False: 返回 logit
         
-        评估模式（修复bug）:
-            - 总是返回 (logit, feat)，便于特征提取和检索指标计算
+        评估模式:
+            - 只返回 feat（512维 BN 后特征），用于检索
         """
-        # 提取特征
         feat = self.add_block(x)
         
-        # 计算分类输出
-        logit = self.classifier(feat)
-        
-        # 【修复】评估时也返回 (logit, feat)，不再丢失 logit
         if self.training:
             if self.return_f:
+                logit = self.classifier(feat)
                 return logit, feat
             else:
+                logit = self.classifier(feat)
                 return logit
         else:
-            # 评估模式：总是返回 (logit, feat)
-            return logit, feat
+            # 评估模式：只返回 BN 后的特征，不过分类器（FSRA 原版行为）
+            return feat
 
 # ==========================================
 # 2. 组装网络: 双视图 (卫星 + 无人机) + 热力分组
@@ -155,8 +215,9 @@ class two_view_net(nn.Module):
         self.return_f = return_f
         self.block = block
         
-        # 加载 DINOv2 骨干网络
-        self.backbone = DINOv2_Backbone()
+        # 加载 DINOv2 骨干网络（可选加载pretrain_path）
+        pretrain_path = getattr(opt, 'pretrain_path', '')
+        self.backbone = DINOv2_Backbone(pretrain_path=pretrain_path)
         feat_dim = self.backbone.in_planes
         
         # 【FSRA风格】全局分类器（用于 CLS token）
@@ -213,15 +274,15 @@ class two_view_net(nn.Module):
 
     def forward(self, x1, x2):
         """
-        前向传播，返回多个分类输出和特征
+        前向传播（严格对齐 FSRA 原版 build_transformer.forward）
         
         Returns:
             训练模式:
-                if return_f: (([cls_0, cls_1, ...], [feat_0, feat_1, ...]), ...)
-                else: ([cls_0, cls_1, ...], ...)
+                if return_f: (([cls_0, ..., cls_global], [feat_0, ..., feat_global]), ...)
+                else: ([cls_0, ..., cls_global], ...)
             
-            评估模式（始终返回特征）:
-                (([cls_0, cls_1, ...], [feat_0, feat_1, ...]), ...)
+            评估模式:
+                (y1, y2) — 每个 y 是 [B, 512, block+1] 的3D张量
         """
         # 提取完整特征 [B, N, D]，其中 N = 1 + num_patches
         x1_features = self.backbone(x1)  # [B, 257, 768]
@@ -234,80 +295,67 @@ class two_view_net(nn.Module):
         cls_token_2 = x2_features[:, 0, :]  # [B, 768]
         patch_token_2 = x2_features[:, 1:, :]  # [B, 256, 768]
         
-        # 【全局特征】用 CLS token 计算分类和特征
+        # 【全局特征】CLS token → ClassBlock
         global_output_1 = self.global_classifier(cls_token_1)
         global_output_2 = self.global_classifier(cls_token_2)
         
-        # 处理全局输出：在评估模式下，ClassBlock 总是返回 (logit, feat)
-        if isinstance(global_output_1, (tuple, list)):
-            cls_global_1, feat_global_1 = global_output_1
-            cls_global_2, feat_global_2 = global_output_2
-        else:
-            cls_global_1 = global_output_1
-            cls_global_2 = global_output_2
-            feat_global_1 = feat_global_2 = None
-        
-        # 如果只有1个block，只返回全局分类输出
+        # block==1 时只有全局分支
         if self.block == 1:
-            # 在评估模式下，需要保证返回特征
-            if not self.training and feat_global_1 is None:
-                raise RuntimeError("Expected features in eval mode")
-            
-            if feat_global_1 is not None:
-                return (cls_global_1, feat_global_1), (cls_global_2, feat_global_2)
-            return cls_global_1, cls_global_2
+            if self.training:
+                return global_output_1, global_output_2
+            else:
+                # 评估模式：ClassBlock 返回纯 feat [B, 512]
+                # reshape 成 [B, 512, 1] 保持统一的3D格式
+                return global_output_1.view(global_output_1.size(0), -1, 1), \
+                       global_output_2.view(global_output_2.size(0), -1, 1)
         
-        # 【局部特征】按热力分组 patch
-        part_features_1 = self.get_heatmap_pool(patch_token_1)  # [B, 768, block]
-        part_features_2 = self.get_heatmap_pool(patch_token_2)  # [B, 768, block]
+        # 【局部特征】按热力分组 patch → [B, 768, block]
+        heat_pool_1 = self.get_heatmap_pool(patch_token_1)
+        heat_pool_2 = self.get_heatmap_pool(patch_token_2)
         
-        # 对每个 block 计算分类输出
-        cls_list_1 = []
-        feat_list_1 = []
-        cls_list_2 = []
-        feat_list_2 = []
+        # 对每个 block 分支过 ClassBlock
+        part_results_1 = []
+        part_results_2 = []
         
         for i in range(self.block):
-            part_feat_1 = part_features_1[:, :, i]  # [B, 768]
-            part_feat_2 = part_features_2[:, :, i]  # [B, 768]
-            
+            part_feat_1 = heat_pool_1[:, :, i]  # [B, 768]
+            part_feat_2 = heat_pool_2[:, :, i]  # [B, 768]
             classifier_i = getattr(self, f'part_classifier_{i}')
+            part_results_1.append(classifier_i(part_feat_1))
+            part_results_2.append(classifier_i(part_feat_2))
+        
+        if self.training:
+            # 训练模式：收集 cls logits 和 features
+            # 把全局分支追加到末尾（和 FSRA 一致：[part_0, ..., part_block-1, global]）
+            y1 = part_results_1 + [global_output_1]
+            y2 = part_results_2 + [global_output_2]
             
-            part_output_1 = classifier_i(part_feat_1)
-            part_output_2 = classifier_i(part_feat_2)
-            
-            # 处理部分输出：在评估模式下，ClassBlock 总是返回 (logit, feat)
-            if isinstance(part_output_1, (tuple, list)):
-                cls_i_1, feat_i_1 = part_output_1
-                cls_i_2, feat_i_2 = part_output_2
+            if self.return_f:
+                # 每个元素是 (logit, feat) 元组
+                cls_list_1 = [item[0] for item in y1]
+                feat_list_1 = [item[1] for item in y1]
+                cls_list_2 = [item[0] for item in y2]
+                feat_list_2 = [item[1] for item in y2]
+                return (cls_list_1, feat_list_1), (cls_list_2, feat_list_2)
             else:
-                cls_i_1 = part_output_1
-                cls_i_2 = part_output_2
-                feat_i_1 = feat_i_2 = None
+                # 每个元素是纯 logit
+                return y1, y2
+        else:
+            # ========== 评估模式（FSRA 原版逻辑）==========
+            # ClassBlock eval 返回纯 feat [B, 512]
+            # 局部分支：stack 成 [B, 512, block]
+            part_feats_1 = torch.stack(part_results_1, dim=2)  # [B, 512, block]
+            part_feats_2 = torch.stack(part_results_2, dim=2)
             
-            cls_list_1.append(cls_i_1)
-            cls_list_2.append(cls_i_2)
+            # 全局分支：reshape [B, 512] → [B, 512, 1]
+            global_feat_1 = global_output_1.view(global_output_1.size(0), -1, 1)
+            global_feat_2 = global_output_2.view(global_output_2.size(0), -1, 1)
             
-            if feat_i_1 is not None:
-                feat_list_1.append(feat_i_1)
-                feat_list_2.append(feat_i_2)
-        
-        # 添加全局分类输出到列表末尾
-        cls_list_1.append(cls_global_1)
-        cls_list_2.append(cls_global_2)
-        
-        # 【修复】根据训练模式和特征可用性决定返回格式
-        # 评估模式下总是返回特征（由 ClassBlock 保证）
-        if feat_global_1 is not None:
-            if feat_list_1:  # 如果有部分特征
-                feat_list_1.append(feat_global_1)
-                feat_list_2.append(feat_global_2)
-            else:  # 如果没有部分特征，创建空列表
-                feat_list_1 = [feat_global_1]
-                feat_list_2 = [feat_global_2]
-            return (cls_list_1, feat_list_1), (cls_list_2, feat_list_2)
-        
-        return cls_list_1, cls_list_2
+            # 拼接：[B, 512, block+1]（和 FSRA 的 torch.cat([y, tranformer_feature], dim=2) 完全对应）
+            y1 = torch.cat([part_feats_1, global_feat_1], dim=2)
+            y2 = torch.cat([part_feats_2, global_feat_2], dim=2)
+            
+            return y1, y2
 
 # ==========================================
 # 3. 工厂函数

@@ -15,7 +15,8 @@ def make_dataset(opt):
         transforms.Resize((opt.h, opt.w), interpolation=3),
         transforms.Pad(opt.pad, padding_mode='edge'),
         transforms.RandomCrop((opt.h, opt.w)),
-        #transforms.RandomHorizontalFlip(),
+        transforms.RandomHorizontalFlip(),
+        transforms.RandomRotation(degrees=10), # 模拟偏航角抖动
         transforms.ToTensor(),
         transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
     ]
@@ -25,7 +26,6 @@ def make_dataset(opt):
         transforms.Pad(opt.pad, padding_mode='edge'),
         
         transforms.RandomCrop((opt.h, opt.w)),
-        #transforms.RandomHorizontalFlip(),
         transforms.ToTensor(),
         transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
     ]
@@ -58,32 +58,34 @@ def make_dataset(opt):
     if opt.train_all:
         train_all = '_all'
 
-    train_datasets = Dataloader_University(opt.train_csv_path, transforms=data_transforms,mode='train')
-    train_samper = Sampler_University(train_datasets,batchsize=opt.batchsize,sample_num=opt.sample_num)
+    train_datasets = Dataloader_University(opt.train_csv_path, transforms=data_transforms, mode='train')
+    # [新增] 训练集降采样：每隔 4 帧取 1 帧，减少冗余，扩大 Batch 内样本差异
+    # train_datasets.image_list = train_datasets.image_list[::4] 
+    
+    train_samper = Sampler_University(train_datasets, batchsize=opt.batchsize, sample_num=opt.sample_num)
     train_dataloader =torch.utils.data.DataLoader(train_datasets, 
                                              batch_size=opt.batchsize,
                                              sampler=train_samper,num_workers=opt.num_worker, 
                                              pin_memory=True,
                                              drop_last=True,
                                              collate_fn=train_collate_fn,
-                                             persistent_workers=True if opt.num_worker > 0 else False,  # 【优化】保留 worker 进程以减少启动开销
-                                             prefetch_factor=2)  # 【优化】增加预加载缓冲区大小
+                                             persistent_workers=True if opt.num_worker > 0 else False,
+                                             prefetch_factor=2 if opt.num_worker > 0 else None)
     val_dataset = Dataloader_University(
         csv_file=opt.val_csv_path,  # 比如 'val.csv'
         transforms=data_transforms, 
         mode='val'                  # 开启验证模式，关闭随机增强
     )
     # 验证集不需要那个复杂的 Sampler，直接按顺序读，甚至不需要打乱 (shuffle=False)
+    # 【关键】验证时必须使用 num_workers=0 保证顺序！多 worker 会导致 query-gallery 对应错位
     val_loader = torch.utils.data.DataLoader(
         val_dataset, 
         batch_size=opt.batchsize,
         shuffle=False,              # 验证集不需要打乱
-        num_workers=opt.num_worker, 
+        num_workers=0,              # 【重要】验证集强制单进程，保证数据顺序一致
         pin_memory=True,
         drop_last=False,            # 验证集一滴都不能少，不能丢弃最后的零星数据
-        collate_fn=train_collate_fn,  # 如果不需要特殊打包，也可以不加这个
-        persistent_workers=True if opt.num_worker > 0 else False,  # 【优化】保留 worker 进程
-        prefetch_factor=2)  # 【优化】预加载缓冲
+        collate_fn=train_collate_fn)  # num_workers=0 时不能设置 prefetch_factor
 
     # 把两个 loader 打包返回
     dataloaders = {'train': train_dataloader, 'val': val_loader}

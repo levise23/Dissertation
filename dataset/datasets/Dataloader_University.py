@@ -6,59 +6,69 @@ import numpy as np
 from PIL import Image
 from torchvision import transforms
 
-import pandas as pd
-import numpy as np
-from torch.utils.data import Dataset
-from PIL import Image
-
 class Dataloader_University(Dataset):
-    def __init__(self, csv_file, transforms,mode):
+    def __init__(self, csv_file, transforms, mode):
         super(Dataloader_University, self).__init__()
-        self.mode=mode
-        if self.mode=='train':
+        self.mode = mode
+        
+        if self.mode == 'train':
             self.transforms_drone = transforms['train']
             self.transforms_satellite = transforms['satellite']
         elif self.mode == 'val':
-            # 验证集通常统一使用 val 的 transform（只做 Resize 和 Normalize）
             self.transforms_drone = transforms['val']
             self.transforms_satellite = transforms['val']
-        # 1. 直接读取你的 CSV 文件（Pandas 会自动识别表头 drone_img, sate_img...）
+        
+        # 读取CSV
         df = pd.read_csv(csv_file)
         
-        # 2. 核心分组逻辑（适配一对一，以及未来的一对多）
-        # 我们用 sate_path (卫星图绝对路径) 作为"地点"的唯一标识
-        # 把同一个 sate_path 对应的所有 drone_path 收集成一个列表
+        # 【所有模式都初始化】位置分组（用于训练集，或备用）
         self.locations = df.groupby('sate_path')['drone_path'].apply(list).to_dict()
+        self.sate_paths_grouped = list(self.locations.keys())
         
-        # 3. 把所有的卫星图路径提出来，存成一个列表，用于索引
-        self.sate_paths = list(self.locations.keys())
+        if self.mode == 'val':
+            # 【修复】验证集：保留CSV行的原始顺序（避免标签-特征错位）
+            # 直接用CSV的行号作为index，保证一一对应的对应关系
+            self.csv_pairs = []
+            for idx, row in df.iterrows():
+                self.csv_pairs.append({
+                    'drone_path': row['drone_path'],
+                    'sate_path': row['sate_path'],
+                    'location_id': self.sate_paths_grouped.index(row['sate_path'])
+                })
+            self.sate_paths = [p['sate_path'] for p in self.csv_pairs]  # 保留原始顺序
+        else:
+            # 【保持不变】训练集：按位置分组（支持同位置多个drone）
+            self.sate_paths = self.sate_paths_grouped  # 去重后的位置列表
+            self.csv_pairs = None  # 训练集不用
 
     def __len__(self):
-        # 数据集的大小就是独立卫星图（地点）的数量
         return len(self.sate_paths)
 
     def __getitem__(self, index):
-        # 1. 拿到当前 index 对应的卫星图绝对路径
-        sate_path = self.sate_paths[index]
+        if self.mode == 'val' and self.csv_pairs is not None:
+            # 【修复】验证集：直接从csv_pairs取，保证顺序
+            pair = self.csv_pairs[index]
+            sate_path = pair['sate_path']
+            drone_path = pair['drone_path']
+            location_id = pair['location_id']
+        else:
+            # 【保持不变】训练集：仍然随机选择
+            sate_path = self.sate_paths[index]
+            drone_path_list = self.locations[sate_path]
+            drone_path = np.random.choice(drone_path_list)
+            location_id = index
         
-        # 2. 拿到这个卫星图对应的所有无人机图路径列表
-        drone_path_list = self.locations[sate_path]
-        
-        # 3. 从列表中随机抽一张无人机图的路径
-        # (如果你现在是一对一，这个列表里就只有1个路径，抽出来就是它本身)
-        drone_path = np.random.choice(drone_path_list)
-
-        # 4. 直接读图！(不再需要 root_dir 和 os.path.join)
+        # 读图
         img_satellite = Image.open(sate_path).convert('RGB')
         img_drone = Image.open(drone_path).convert('RGB')
-
-        # 5. 数据增强
+        
+        # 数据增强
         if self.transforms_satellite:
             img_satellite = self.transforms_satellite(img_satellite)
         if self.transforms_drone:
             img_drone = self.transforms_drone(img_drone)
-
-        return img_satellite, img_drone, index
+        
+        return img_satellite, img_drone, location_id
 
 
 class Sampler_University(torch.utils.data.Sampler):
