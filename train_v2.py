@@ -176,7 +176,9 @@ def validate_reid(model, val_loader, use_gpu=True, verbose=False):
     
     query_features = fsra_normalize(query_features)
     gallery_features = fsra_normalize(gallery_features)
-    
+    torch.save(query_features, "query_features.pt")
+    torch.save(gallery_features, "gallery_features.pt")
+    print("✅ 无人机与卫星图特征已成功保存为 .pt 文件！")
     # ========== 余弦相似度检索（FSRA 用 torch.mm(gf, qf) 即相似度越大越好）==========
     if use_gpu:
         device = torch.device('cuda:0')

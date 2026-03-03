@@ -82,7 +82,7 @@ python train_v2.py \
     --triplet_loss 2 \
     --loss_type "soft_triplet" \
     --num_epochs 2 \
-    --train_stride 2 \
+    --train_stride 4 \
     --train_offset 1
 # 2. 跑 Offset=1 (接着 Offset=0 的权重跑)
 # 注意：你需要手动指定上一步生成的 checkpoint 路径
