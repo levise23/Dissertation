@@ -9,7 +9,13 @@ def make_dataset(opt):
     # Load Data
     # ---------
     #
+    
+    # [新增] 动态 stride 配置：从 opt 读取，如果没设置默认为 1（不抽样）
+    train_stride = getattr(opt, 'train_stride', 1) 
+    # [新增] 初始偏移
+    train_offset = getattr(opt, 'train_offset', 0)
 
+    # ... transforms code ...
     transform_train_list = [
         # transforms.RandomResizedCrop(size=(opt.h, opt.w), scale=(0.75,1.0), ratio=(0.75,1.3333), interpolation=3), #Image.BICUBIC)
         transforms.Resize((opt.h, opt.w), interpolation=3),
@@ -58,8 +64,9 @@ def make_dataset(opt):
     if opt.train_all:
         train_all = '_all'
 
-    train_datasets = Dataloader_University(opt.train_csv_path, transforms=data_transforms, mode='train')
-    # [新增] 训练集降采样：每隔 4 帧取 1 帧，减少冗余，扩大 Batch 内样本差异
+    train_datasets = Dataloader_University(opt.train_csv_path, transforms=data_transforms, mode='train', 
+                                          stride=train_stride, offset=train_offset)
+    # [Old Logic Disabled]
     # train_datasets.image_list = train_datasets.image_list[::4] 
     
     train_samper = Sampler_University(train_datasets, batchsize=opt.batchsize, sample_num=opt.sample_num)
@@ -74,7 +81,8 @@ def make_dataset(opt):
     val_dataset = Dataloader_University(
         csv_file=opt.val_csv_path,  # 比如 'val.csv'
         transforms=data_transforms, 
-        mode='val'                  # 开启验证模式，关闭随机增强
+        mode='val',                  # 开启验证模式，关闭随机增强
+        stride=1, offset=0           # 验证集不进行循环抽样，保持全量
     )
     # 验证集不需要那个复杂的 Sampler，直接按顺序读，甚至不需要打乱 (shuffle=False)
     # 【关键】验证时必须使用 num_workers=0 保证顺序！多 worker 会导致 query-gallery 对应错位

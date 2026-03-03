@@ -202,7 +202,7 @@ def get_parse():
     parser.add_argument('--gpu_ids', default='1,2,3', type=str, help='gpu_ids: e.g. 0  0,1,2  0,2')
     parser.add_argument('--name', default='test', type=str, help='output model name')
     
-    parser.add_argument('--train_csv_path', default='/usr1/home/s125mdg43_07/remote/rebuild_UAV_dataset/stride=4/train_pairs.csv', type=str, help='path to the training csv file')
+    parser.add_argument('--train_csv_path', default='/usr1/home/s125mdg43_07/remote/rebuild_UAV/train_pairs.csv', type=str, help='path to the training csv file')
     parser.add_argument('--val_csv_path', default='/usr1/home/s125mdg43_07/remote/rebuild_UAV_dataset/stride=4/val_pairs.csv', type=str, help='path to the val csv file')
 
     parser.add_argument('--train_all', action='store_true', help='use all training data')
@@ -247,6 +247,11 @@ def get_parse():
     parser.add_argument('--backbone', default="VIT-S", type=str, help='')
     parser.add_argument('--pretrain_path', default="", type=str, help='Path to pretrained checkpoint (e.g., net_040.pth). Leave empty to train from scratch with official DINOv2 weights')
     
+    # [新增] 动态 stride 配置：支持循环抽样 (Curriculum Learning)
+    # 示例：每个 Epoch 换一个 offset，用不同的 subset 训练
+    parser.add_argument('--train_stride', default=1, type=int, help='Data subsampling stride (e.g., 4 means use 1/4 data per epoch)')
+    parser.add_argument('--train_offset', default=0, type=int, help='Data subsampling offset (start index)')
+
     # 【新增】验证频率控制：每 N 个 epoch 验证一次，避免频繁计算全量矩阵导致 OOM
     parser.add_argument('--val_freq', default=2, type=int, help='validation frequency (every N epochs)')
 
@@ -457,7 +462,7 @@ def train_model(model, opt, optimizer, scheduler, dataloaders_dict, log_path=Non
                     f.write(",,,\n")  # 空值占位
 
         # 保存模型
-        if epoch == 119 or epoch == 79 or (epoch % 10 == 0 and epoch > 0):
+        if epoch == 119 or epoch == 20 or (epoch % 10 == 0 and epoch > 0):
             # 【修复】剥离 DataParallel 的外壳以保证单卡推理能够顺利加载权重
             model_to_save = model.module if hasattr(model, 'module') else model
             save_network(model_to_save, opt.name, epoch)
@@ -469,7 +474,19 @@ def train_model(model, opt, optimizer, scheduler, dataloaders_dict, log_path=Non
 
 if __name__ == '__main__':
     opt = get_parse()
-    
+
+    # [新增] 自动循环抽样 (Cyclic Subsampling)
+    # 如果设置了 train_stride > 1 (比如4)，但没有设置 offset
+    # 可以在这里根据 epoch 动态设置 opt.train_offset 吗？不行，make_dataset 只能调一次
+    # 所以如果你要完全动态，需要在 main loop 里重新 make_dataset，这比较慢
+    # 
+    # [折中方案]：先保持静态配置，如果想玩动态，需要写个 shell 脚本外层循环调用
+    # 或者把 make_dataset 放到 epoch 循环里（不推荐）。
+    #
+    # 最佳实践：直接在这里打印配置
+    if opt.train_stride > 1:
+        print(f"[*] Curriculum Learning Mode: Stride={opt.train_stride}, Offset={opt.train_offset}")
+
     str_ids = opt.gpu_ids.split(',')
     gpu_ids = [int(str_id) for str_id in str_ids if int(str_id) >= 0]
 
@@ -530,9 +547,35 @@ if __name__ == '__main__':
                     clean_key = k.replace('module.', '') if k.startswith('module.') else k
                     clean_state_dict[clean_key] = v
                 
+                # 【修正】过滤策略：
+                # 1. 跳过所有 classifier 权重（因为 offset 变化后 class_id → 物理位置映射已改变，
+                #    强行加载旧 classifier 会在前几个 epoch 产生语义混乱）
+                # 2. 跳过形状不匹配的权重（兼容 nclasses 不一致的情况）
+                CLASSIFIER_KEYS = ('classifier', 'part_classifier', 'global_classifier')
+                model_state_dict = model.state_dict()
+                filtered_state_dict = {}
+                skipped_classifier = []
+                skipped_shape = []
+                for k, v in clean_state_dict.items():
+                    # 跳过所有 classifier 相关层
+                    if any(ck in k for ck in CLASSIFIER_KEYS):
+                        skipped_classifier.append(k)
+                        continue
+                    if k in model_state_dict:
+                        if v.shape == model_state_dict[k].shape:
+                            filtered_state_dict[k] = v
+                        else:
+                            skipped_shape.append(f"{k}: {v.shape} vs {model_state_dict[k].shape}")
+                if skipped_classifier:
+                    print(f"    [*] Skipped {len(skipped_classifier)} classifier layer(s) (class-ID remapping)")
+                if skipped_shape:
+                    for s in skipped_shape:
+                        print(f"    [!] Shape mismatch skipped: {s}")
+
                 # 加载权重，strict=False 允许大小不匹配（比如新增层）
-                incompatible = model.load_state_dict(clean_state_dict, strict=False)
-                print(f"[✓] Pretrained weights loaded successfully!")
+                incompatible = model.load_state_dict(filtered_state_dict, strict=False)
+                
+                print(f"[✓] Pretrained weights loaded successfully (filtered)!")
                 if incompatible.missing_keys:
                     print(f"    Warning: {len(incompatible.missing_keys)} keys not found in checkpoint")
                 if incompatible.unexpected_keys:
@@ -575,3 +618,6 @@ if __name__ == '__main__':
         dataloaders_dict=dataloaders_dict,
         log_path=log_path
     )
+
+    # 强制退出：避免多进程 DataLoader worker 的 atexit 清理卡住进程
+    os._exit(0)

@@ -7,9 +7,11 @@ from PIL import Image
 from torchvision import transforms
 
 class Dataloader_University(Dataset):
-    def __init__(self, csv_file, transforms, mode):
+    def __init__(self, csv_file, transforms, mode, stride=1, offset=0):
         super(Dataloader_University, self).__init__()
         self.mode = mode
+        self.stride = stride
+        self.offset = offset
         
         if self.mode == 'train':
             self.transforms_drone = transforms['train']
@@ -24,6 +26,13 @@ class Dataloader_University(Dataset):
         # 【所有模式都初始化】位置分组（用于训练集，或备用）
         self.locations = df.groupby('sate_path')['drone_path'].apply(list).to_dict()
         self.sate_paths_grouped = list(self.locations.keys())
+        
+        # [Cyclic Subsampling 核心逻辑]
+        # 对训练集的位置列表进行切片
+        if self.mode == 'train' and self.stride > 1:
+            self.sate_paths_grouped = self.sate_paths_grouped[self.offset::self.stride]
+            print(f"[*] Dataloader Subsampling: Stride={self.stride}, Offset={self.offset}, "
+                  f"Subset Size={len(self.sate_paths_grouped)}") # Debug info
         
         if self.mode == 'val':
             # 【修复】验证集：保留CSV行的原始顺序（避免标签-特征错位）
