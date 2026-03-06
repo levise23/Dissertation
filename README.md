@@ -1,26 +1,27 @@
-这readme怎么写了好几次都没保存下来啊
-现在是保存了一个 val的结果，结果可视化。
+I've tried writing this readme several times but haven't been saved.
 
-根据这个结果，考虑将输出的R@10做一个经纬度判断，因为其容易出现234 259是正确位置，而只看前三五容易出错。在取图送入后续流程的时候质量越高越好。
-模型训练之后的调用
-  模型遍历gallery切片生成pt特征向量文件，然后对后续来的无人机视频帧生成特征向量，去做匹配，但是我目前的结构是双塔，这个有点问题。
-  对相应的R@10 候选列表做经纬度的分析，越靠近的结果给出越高的推荐，如果整体非常松散，置信度不高，就触发gpt调用？
-  那集群这一特性怎么展示？
-  集群这一特性其实就意味着 时间上的连续特征向量和空间上的多个特征向量。特征向量意味着定位到的clip
-  移动rtK基站意味着极高的相对位置估计是合理的，现实的，那就这样为前提。
-  我要梳理一下我的想法，我有一个能在卫星切片中找出与无人机下视视角对应切片的模型。
-  A（drone)的k时刻推理意味着一次定位，对候选R@10的位置做记录，而B drone k时刻同样推理，
-  且已知两者相对位置差距和方向，这样，在两个R@10的候选中，找出符合约束的定位，就要比单个
-  的定位精确，而时间上的定位同样要考虑，k+1时刻，与k时刻的定位距离差距也是约束。时间，空
-  间上都需要平滑，置信的结果序列
-  gemini表示，后面的定位问题，1.再训练一个模型，在大切片里找最匹配的，提高系统精度
-  2.通过优化 约束的方法，将k个无人机之间的相对距离拿到，作为约束条件，而R@10条件作为求解空间，，因为其定位不会超过切片的sqrt(2)
-  而切片大小是可以控制的，不像序列帧一样重复，会误导人，那我现在需要重新构造数据集，包括
-  卫星全图切片，经纬度位置，如果想要省去运算，可以提前将所有经纬度换成卫星图内绝对距离坐标 这里会需要确定我所用的模型，用它生成gallery的pt
-  现在无人机一张图太大了，01 第一张 390m width 250m height 但是只要能定位到这个切片内，也还算可以？
+Currently, I've saved a single value result for visualization.
 
-  使用卫星图02做切片，300*300 500的话224分辨率完全失去细节了
-  明天就统一数据，包括然后做优化题，后面做可视化，以及序列可视化，如果可以，考虑直接切卫星图当作无人机图，这样就不受航拍序列的约束了
-  
-  
-  
+Based on this result, I'm considering performing a latitude and longitude determination on the output R@10, as it's easy to find the correct location at positions 234 and 259, while only looking at the first three or five positions is prone to error. Higher image quality is better when feeding the image into subsequent processes.
+
+Model Calls After Training
+
+The model iterates through gallery slices to generate pt feature vector files, then generates feature vectors for subsequent drone video frames for matching. However, my current structure is a dual-tower configuration, which presents a problem.
+
+I'm performing latitude and longitude analysis on the corresponding R@10 candidate list, giving higher recommendations to results closer to each other. If the overall structure is very loose and the confidence level is low, should I trigger a gpt call?
+
+How do I demonstrate the clustering characteristic?
+
+The clustering characteristic essentially means continuous feature vectors in time and multiple feature vectors in space. Feature vectors represent the located clips.
+
+Mobile RTK base stations imply that extremely high relative position estimation is reasonable and realistic, so let's assume this is the premise.
+
+Let me outline my thinking. I have a model that can find the slice corresponding to the drone's downward-looking view from satellite slices.
+
+The inference at time k for drone A (A) means a localization operation, recording the position of candidate R@10. Drone B performs the same inference at time k.
+
+Given the known relative position difference and direction between the two, finding the constrained localization among the two R@10 candidates is more accurate than localization for a single drone.
+
+Time-based localization also needs to be considered; the distance difference between the localization at time k+1 and time k is also a constraint. Time and space both need to be smoothed, and the confidence result sequence needs to be obtained. Gemini indicates that for the subsequent localization problem, 1. train another model to find the best match in the large slice to improve the system accuracy. 2. By optimizing the constraint method, the relative distance between k drones is obtained as the constraint condition, and the R@10 condition is used as the solution space, because its localization will not exceed the sqrt(2) of the slice. The slice size can be controlled, unlike the repeated sequence frames, which will mislead people. So now I need to reconstruct the dataset, including the satellite full map slice, latitude and longitude positions. If you want to save the calculation, you can replace all the latitude and longitude with the absolute distance coordinates in the satellite map in advance. Here I need to determine the model I use and use it to generate the gallery's pt. Now the drone's image is too big. 01 The first image is 390m width 250m height. But as long as it can be located within this slice, it is still acceptable? Using satellite image 02 for tiling, at 300x300 or 500 pixels, the 224 resolution completely loses detail.
+
+Tomorrow we'll unify the data, including doing optimization problems, followed by visualization and sequence visualization. If possible, we'll consider directly tiling the satellite image as drone images, thus avoiding the constraints of aerial photography sequences.
